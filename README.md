@@ -2,6 +2,8 @@
 
 Control notification position on macOS.
 
+**Note: I can't run Hackintosh anymore, so development is in a feature freeze. Users say the app works on macOS 26 just fine. If the app breaks, I can borrow my friends' Mac and fix it. Rest assured, new features will come when I can afford my own Macbook!**
+
 ![image](https://github.com/user-attachments/assets/469b318f-eba5-464f-87be-74d3decaa8a2)
 
 As seen in [Lifehacker](https://lifehacker.com/tech/change-where-macos-notifications-show-up)
