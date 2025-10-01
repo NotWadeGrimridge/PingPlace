@@ -50,12 +50,13 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return position
     }()
 
-    private func debugLog(_ message: String) {
+    func debugLog(_ message: String) {
         guard debugMode else { return }
         logger.info("\(message, privacy: .public)")
     }
 
     func applicationDidFinishLaunching(_: Notification) {
+        debugLog("PingPlace started - position: \(currentPosition.displayName)")
         checkAccessibilityPermissions()
         setupObserver()
         if !isMenuBarIconHidden {
@@ -216,7 +217,12 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func cacheInitialNotificationData(windowSize: CGSize, notifSize: CGSize, position: CGPoint) {
         guard cachedInitialPosition == nil else { return }
 
-        let screenWidth: CGFloat = NSScreen.main!.frame.width
+        // Use primary screen (first screen with menu bar)
+        guard let primaryScreen = NSScreen.screens.first else {
+            debugLog("Failed to get primary screen")
+            return
+        }
+        let screenWidth: CGFloat = primaryScreen.frame.width
         var padding: CGFloat
         var effectivePosition = position
 
@@ -234,11 +240,17 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         cachedInitialNotifSize = notifSize
         cachedInitialPadding = padding
 
-        debugLog("Initial notification cached - size: \(notifSize), position: \(effectivePosition), padding: \(padding)")
+        debugLog("Initial notification cached - size: \(notifSize), position: \(effectivePosition), padding: \(padding), screenSize: \(primaryScreen.frame.width)x\(primaryScreen.frame.height)")
     }
 
     func moveNotification(_ window: AXUIElement) {
-        guard currentPosition != .topRight else { return }
+        debugLog("moveNotification called, currentPosition: \(currentPosition.displayName)")
+
+        // Skip moving if user wants default macOS position (top-right)
+        guard currentPosition != .topRight else {
+            debugLog("Skipping - position is topRight (default)")
+            return
+        }
 
         // if let identifier: String = getWindowIdentifier(window), identifier.hasPrefix("widget") {
         //     return
@@ -434,12 +446,37 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         })?.processIdentifier else { return false }
 
         let app: AXUIElement = AXUIElementCreateApplication(pid)
-        return findElementWithWidgetIdentifier(root: app) != nil
+
+        // Check if there's a visible widget window by looking at window count
+        // When NC sidebar is open, there are multiple windows including widgets
+        // When just showing notifications, there are fewer windows
+        var windowsRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows: [AXUIElement] = windowsRef as? [AXUIElement]
+        else {
+            return false
+        }
+
+        var widgetWindowCount = 0
+
+        for window in windows {
+            if let identifier = getWindowIdentifier(window) {
+                if identifier.hasPrefix("widget-local") {
+                    widgetWindowCount += 1
+                }
+            }
+        }
+
+        // Only consider NC UI open if there are multiple widget windows
+        // A single widget window seems to exist in the background even when NC is closed
+        return widgetWindowCount > 1
     }
 
     private func findElementWithWidgetIdentifier(root: AXUIElement) -> AXUIElement? {
-        if let identifier: String = getWindowIdentifier(root), identifier.hasPrefix("widget-local") {
-            return root
+        if let identifier: String = getWindowIdentifier(root) {
+            if identifier.hasPrefix("widget-local") {
+                return root
+            }
         }
 
         var childrenRef: AnyObject?
@@ -471,7 +508,13 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         position: CGPoint,
         padding: CGFloat
     ) -> (x: CGFloat, y: CGFloat) {
-        debugLog("Calculating new position with windowSize: \(windowSize), notifSize: \(notifSize), position: \(position), padding: \(padding)")
+        // Use primary screen (first screen with menu bar)
+        guard let primaryScreen = NSScreen.screens.first else {
+            debugLog("Failed to get primary screen for position calculation")
+            return (0, 0)
+        }
+
+        debugLog("Calculating new position with windowSize: \(windowSize), notifSize: \(notifSize), position: \(position), padding: \(padding), primaryScreen: \(primaryScreen.frame.width)x\(primaryScreen.frame.height)")
         let newX: CGFloat
         let newY: CGFloat
 
@@ -479,7 +522,7 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .topLeft, .middleLeft, .bottomLeft:
             newX = padding - position.x
         case .topMiddle, .bottomMiddle, .deadCenter:
-            newX = (windowSize.width - notifSize.width) / 2 - position.x
+            newX = (primaryScreen.frame.width - notifSize.width) / 2 - position.x
         case .topRight, .middleRight, .bottomRight:
             newX = 0
         }
@@ -488,14 +531,14 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         case .topLeft, .topMiddle, .topRight:
             newY = 0
         case .middleLeft, .middleRight, .deadCenter:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = (windowSize.height - notifSize.height) / 2 - dockSize
+            let dockSize: CGFloat = primaryScreen.frame.height - primaryScreen.visibleFrame.height
+            newY = (primaryScreen.frame.height - notifSize.height) / 2 - dockSize
         case .bottomLeft, .bottomMiddle, .bottomRight:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = windowSize.height - notifSize.height - dockSize - paddingAboveDock
+            let dockSize: CGFloat = primaryScreen.frame.height - primaryScreen.visibleFrame.height
+            newY = primaryScreen.frame.height - notifSize.height - dockSize - paddingAboveDock
         }
 
-        debugLog("Calculated new position - x: \(newX), y: \(newY)")
+        debugLog("Calculated new position - x: \(newX), y: \(newY) for position: \(currentPosition.displayName)")
         return (newX, newY)
     }
 
