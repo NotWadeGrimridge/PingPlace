@@ -240,16 +240,17 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func moveNotification(_ window: AXUIElement) {
         guard currentPosition != .topRight else { return }
 
-        // if let identifier: String = getWindowIdentifier(window), identifier.hasPrefix("widget") {
-        //     return
-        // }
-
-        if hasNotificationCenterUI() {
-            debugLog("Skipping move - Notification Center UI detected")
+        if let identifier: String = getWindowIdentifier(window), identifier.hasPrefix("widget") {
+            debugLog("Skipping move - widget window detected: \(identifier)")
             return
         }
 
-        let targetSubroles: [String] = ["AXNotificationCenterBanner", "AXNotificationCenterAlert"]
+        let targetSubroles: [String] = [
+            "AXNotificationCenterBanner",
+            "AXNotificationCenterAlert",
+            "AXNotificationCenterNotification",
+            "AXNotificationCenterBannerWindow",
+        ]
         guard let windowSize: CGSize = getSize(of: window),
               let bannerContainer: AXUIElement = findElementWithSubrole(root: window, targetSubroles: targetSubroles),
               let notifSize: CGSize = getSize(of: bannerContainer),
