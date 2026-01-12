@@ -10,7 +10,7 @@ build:
 	swiftc src/PingPlace.swift -o PingPlace.app/Contents/MacOS/PingPlace-arm64 -O -target arm64-apple-macos14.0
 	lipo -create -output PingPlace.app/Contents/MacOS/PingPlace PingPlace.app/Contents/MacOS/PingPlace-x86_64 PingPlace.app/Contents/MacOS/PingPlace-arm64
 	rm PingPlace.app/Contents/MacOS/PingPlace-x86_64 PingPlace.app/Contents/MacOS/PingPlace-arm64
-	codesign --entitlements src/PingPlace.entitlements -fvs "PingPlace" PingPlace.app
+	codesign --entitlements src/PingPlace.entitlements -fvs - PingPlace.app
 
 run:
 	@open PingPlace.app

@@ -52,7 +52,7 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func debugLog(_ message: String) {
         guard debugMode else { return }
-        logger.info("\(message, privacy: .public)")
+        print("[DEBUG] \(message)")
     }
 
     func applicationDidFinishLaunching(_: Notification) {
@@ -244,10 +244,10 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         //     return
         // }
 
-        if hasNotificationCenterUI() {
-            debugLog("Skipping move - Notification Center UI detected")
-            return
-        }
+        // if hasNotificationCenterUI() {
+        //     debugLog("Skipping move - Notification Center UI detected")
+        //     return
+        // }
 
         let targetSubroles: [String] = ["AXNotificationCenterBanner", "AXNotificationCenterAlert"]
         guard let windowSize: CGSize = getSize(of: window),
@@ -472,27 +472,52 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         padding: CGFloat
     ) -> (x: CGFloat, y: CGFloat) {
         debugLog("Calculating new position with windowSize: \(windowSize), notifSize: \(notifSize), position: \(position), padding: \(padding)")
+        
+        guard let screen = NSScreen.main else {
+            debugLog("Failed to get main screen")
+            return (0, 0)
+        }
+        
+        let screenFrame = screen.visibleFrame
         let newX: CGFloat
         let newY: CGFloat
-
+        let horizontalPadding: CGFloat = 10.0 // Standard padding
+        let verticalPadding: CGFloat = 10.0
+        
+        // Calculate X
         switch currentPosition {
         case .topLeft, .middleLeft, .bottomLeft:
-            newX = padding - position.x
+            newX = screenFrame.minX + horizontalPadding
         case .topMiddle, .bottomMiddle, .deadCenter:
-            newX = (windowSize.width - notifSize.width) / 2 - position.x
+            newX = screenFrame.midX - (notifSize.width / 2)
         case .topRight, .middleRight, .bottomRight:
-            newX = 0
+            newX = screenFrame.maxX - notifSize.width - horizontalPadding
         }
-
+        
+        // Calculate Y
+        // Note: Screen coordinates origin is usually bottom-left in Cocoa (NSRect) but top-left in Accessibility (CGPoint)?
+        // Accessibility API (AX) uses top-left as (0,0) of the main screen usually (flipped coordinates relative to Cocoa).
+        // Let's assume AX uses global display coordinates where (0,0) is top-left of primary screen.
+        // NSScreen.frame is bottom-left origin.
+        // We need to convert.
+        
+        let screenHeight = screen.frame.height
+        let screenY = screen.frame.origin.y // Usually 0 for main
+        
+        // Helper to convert Cocoa Y (bottom-up) to AX Y (top-down) if needed, 
+        // BUT AXPosition usually matches the screen layout. 
+        // Let's calculate purely in top-down logic assuming (0,0) is top-left of screen.
+        
+        let topPadding: CGFloat = screen.frame.height - screen.visibleFrame.maxY + verticalPadding // Menu bar area + padding
+        let bottomPadding: CGFloat = screen.visibleFrame.minY + verticalPadding // Dock area + padding
+        
         switch currentPosition {
         case .topLeft, .topMiddle, .topRight:
-            newY = 0
+            newY = topPadding
         case .middleLeft, .middleRight, .deadCenter:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = (windowSize.height - notifSize.height) / 2 - dockSize
+            newY = (screenHeight - notifSize.height) / 2
         case .bottomLeft, .bottomMiddle, .bottomRight:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = windowSize.height - notifSize.height - dockSize - paddingAboveDock
+            newY = screenHeight - notifSize.height - bottomPadding
         }
 
         debugLog("Calculated new position - x: \(newX), y: \(newY)")
