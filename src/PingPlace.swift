@@ -38,7 +38,9 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var cachedInitialPadding: CGFloat?
 
     private var widgetMonitorTimer: Timer?
+    private var windowPollingTimer: Timer?
     private var lastWidgetWindowCount: Int = 0
+    private var lastKnownWindowCount: Int = 0
     private var pollingEndTime: Date?
 
     private var currentPosition: NotificationPosition = {
@@ -56,12 +58,14 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationDidFinishLaunching(_: Notification) {
-        checkAccessibilityPermissions()
-        setupObserver()
         if !isMenuBarIconHidden {
             setupStatusItem()
         }
-        moveAllNotifications()
+        checkAccessibilityPermissions()
+        if AXIsProcessTrusted() {
+            setupObserver()
+            moveAllNotifications()
+        }
     }
 
     func applicationWillBecomeActive(_: Notification) {
@@ -72,19 +76,21 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func checkAccessibilityPermissions() {
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
-        guard AXIsProcessTrustedWithOptions(options as CFDictionary) else {
-            let alert = NSAlert()
-            alert.messageText = "Accessibility Permission Required"
-            alert.informativeText = "PingPlace needs accessibility permission to detect and move notifications.\n\nPlease grant permission in System Settings and restart the app."
-            alert.addButton(withTitle: "Open System Settings")
-            alert.addButton(withTitle: "Quit")
+        // Check without prompting first
+        if AXIsProcessTrusted() { return }
 
-            if alert.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        // Not trusted — prompt and open settings, but don't quit.
+        // The user can grant permission and the app will pick it up via polling.
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true]
+        _ = AXIsProcessTrustedWithOptions(options as CFDictionary)
+
+        // Poll until trusted, then set up the observer
+        Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+            if AXIsProcessTrusted() {
+                timer.invalidate()
+                self.setupObserver()
+                self.moveAllNotifications()
             }
-            NSApplication.shared.terminate(nil)
-            return
         }
     }
 
@@ -237,24 +243,51 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         debugLog("Initial notification cached - size: \(notifSize), position: \(effectivePosition), padding: \(padding)")
     }
 
+    private func isWidgetWindow(_ window: AXUIElement) -> Bool {
+        if let identifier: String = getWindowIdentifier(window), identifier.hasPrefix("widget") {
+            return true
+        }
+        if findElementWithWidgetIdentifier(root: window) != nil {
+            return true
+        }
+        return false
+    }
+
     func moveNotification(_ window: AXUIElement) {
         guard currentPosition != .topRight else { return }
 
-        // if let identifier: String = getWindowIdentifier(window), identifier.hasPrefix("widget") {
-        //     return
-        // }
-
-        if hasNotificationCenterUI() {
-            debugLog("Skipping move - Notification Center UI detected")
+        if isWidgetWindow(window) {
+            debugLog("Skipping move - widget window detected")
             return
         }
 
-        let targetSubroles: [String] = ["AXNotificationCenterBanner", "AXNotificationCenterAlert"]
-        guard let windowSize: CGSize = getSize(of: window),
-              let bannerContainer: AXUIElement = findElementWithSubrole(root: window, targetSubroles: targetSubroles),
-              let notifSize: CGSize = getSize(of: bannerContainer),
-              let position: CGPoint = getPosition(of: bannerContainer)
-        else {
+        let targetSubroles: [String] = [
+            "AXNotificationCenterBanner",
+            "AXNotificationCenterAlert",
+            "AXNotificationCenterNotification",
+            "AXNotificationCenterBannerWindow",
+        ]
+        guard let windowSize: CGSize = getSize(of: window) else {
+            debugLog("Failed to get window size")
+            return
+        }
+
+        // Try finding banner container by subrole (works on older macOS)
+        // Fall back to using the window itself (macOS 26.3+ uses AXSystemDialog)
+        let notifSize: CGSize
+        let position: CGPoint
+
+        if let found = findElementWithSubrole(root: window, targetSubroles: targetSubroles),
+           let size = getSize(of: found),
+           let pos = getPosition(of: found) {
+            notifSize = size
+            position = pos
+        } else if let size = getSize(of: window),
+                  let pos = getPosition(of: window) {
+            debugLog("Using window directly for positioning (macOS 26.3+ fallback)")
+            notifSize = size
+            position = pos
+        } else {
             debugLog("Failed to get notification dimensions or find banner container")
             return
         }
@@ -397,9 +430,41 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
         debugLog("Observer setup complete for Notification Center (PID: \(pid))")
 
+        // Track existing window count at startup
+        lastKnownWindowCount = getNotificationWindowCount()
+
         widgetMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { _ in
             self.checkForWidgetChanges()
         }
+
+        // Poll for new windows since kAXWindowCreatedNotification may not fire on macOS 26.3+
+        windowPollingTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { _ in
+            self.pollForNewWindows()
+        }
+    }
+
+    private func getNotificationWindowCount() -> Int {
+        guard let pid: pid_t = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == notificationCenterBundleID
+        })?.processIdentifier else { return 0 }
+
+        let app: AXUIElement = AXUIElementCreateApplication(pid)
+        var windowsRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else { return 0 }
+
+        return windows.count
+    }
+
+    private func pollForNewWindows() {
+        let currentCount = getNotificationWindowCount()
+
+        if currentCount > lastKnownWindowCount {
+            debugLog("Polling detected new window(s): \(lastKnownWindowCount) -> \(currentCount)")
+            moveAllNotifications()
+        }
+
+        lastKnownWindowCount = currentCount
     }
 
     private func getWindowIdentifier(_ element: AXUIElement) -> String? {
