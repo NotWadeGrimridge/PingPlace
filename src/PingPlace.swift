@@ -2,26 +2,6 @@ import ApplicationServices
 import Cocoa
 import os.log
 
-enum NotificationPosition: String, CaseIterable {
-    case topLeft, topMiddle, topRight
-    case middleLeft, deadCenter, middleRight
-    case bottomLeft, bottomMiddle, bottomRight
-
-    var displayName: String {
-        switch self {
-        case .topLeft: return "Top Left"
-        case .topMiddle: return "Top Middle"
-        case .topRight: return "Top Right"
-        case .middleLeft: return "Middle Left"
-        case .deadCenter: return "Middle"
-        case .middleRight: return "Middle Right"
-        case .bottomLeft: return "Bottom Left"
-        case .bottomMiddle: return "Bottom Middle"
-        case .bottomRight: return "Bottom Right"
-        }
-    }
-}
-
 class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let notificationCenterBundleID: String = "com.apple.notificationcenterui"
     private let paddingAboveDock: CGFloat = 30
@@ -32,10 +12,14 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private let debugMode: Bool = UserDefaults.standard.bool(forKey: "debugMode")
     private let launchAgentPlistPath: String = NSHomeDirectory() + "/Library/LaunchAgents/com.grimridge.PingPlace.plist"
 
-    private var cachedInitialPosition: CGPoint?
-    private var cachedInitialWindowSize: CGSize?
-    private var cachedInitialNotifSize: CGSize?
-    private var cachedInitialPadding: CGFloat?
+    private struct ScreenCache {
+        var initialPosition: CGPoint
+        var initialWindowSize: CGSize
+        var initialNotifSize: CGSize
+        var initialPadding: CGFloat
+    }
+
+    private var screenCaches: [CGDirectDisplayID: ScreenCache] = [:]
 
     private var widgetMonitorTimer: Timer?
     private var windowPollingTimer: Timer?
@@ -65,6 +49,32 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if AXIsProcessTrusted() {
             setupObserver()
             moveAllNotifications()
+        }
+
+        // Re-position when displays change (plug/unplug monitor, resolution change)
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.debugLog("Screen parameters changed — clearing caches")
+            self?.screenCaches.removeAll()
+            self?.moveAllNotifications()
+        }
+
+        // Stop polling on sleep, reinitialize on wake
+        let wsnc = NSWorkspace.shared.notificationCenter
+        wsnc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.debugLog("System sleeping — stopping polling")
+            self?.windowPollingTimer?.invalidate()
+            self?.widgetMonitorTimer?.invalidate()
+        }
+        wsnc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            self?.debugLog("System woke — reinitializing")
+            self?.screenCaches.removeAll()
+            if AXIsProcessTrusted() {
+                self?.setupObserver()
+                self?.moveAllNotifications()
+            }
         }
     }
 
@@ -219,28 +229,32 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         moveAllNotifications()
     }
 
-    private func cacheInitialNotificationData(windowSize: CGSize, notifSize: CGSize, position: CGPoint) {
-        guard cachedInitialPosition == nil else { return }
+    private func cacheInitialNotificationData(
+        screen: NSScreen,
+        windowSize: CGSize,
+        notifSize: CGSize,
+        position: CGPoint
+    ) -> ScreenCache {
+        let displayID = screen.displayID
+        if let existing = screenCaches[displayID] { return existing }
 
-        let screenWidth: CGFloat = NSScreen.main!.frame.width
-        var padding: CGFloat
-        var effectivePosition = position
+        let screenWidth = screen.frame.width
+        let (effectivePosition, padding) = NotificationGeometry.initialData(
+            screenWidth: screenWidth,
+            notifSize: notifSize,
+            position: position
+        )
 
-        if position.x + notifSize.width > screenWidth {
-            debugLog("Detected incorrect initial position.x: \(position.x). Recalculating position.")
-            padding = 16.0
-            effectivePosition.x = screenWidth - notifSize.width - padding
-        } else {
-            let rightEdge: CGFloat = position.x + notifSize.width
-            padding = screenWidth - rightEdge
-        }
+        let cache = ScreenCache(
+            initialPosition: effectivePosition,
+            initialWindowSize: windowSize,
+            initialNotifSize: notifSize,
+            initialPadding: padding
+        )
+        screenCaches[displayID] = cache
 
-        cachedInitialPosition = effectivePosition
-        cachedInitialWindowSize = windowSize
-        cachedInitialNotifSize = notifSize
-        cachedInitialPadding = padding
-
-        debugLog("Initial notification cached - size: \(notifSize), position: \(effectivePosition), padding: \(padding)")
+        debugLog("Cached for display \(displayID) - size: \(notifSize), pos: \(effectivePosition), padding: \(padding)")
+        return cache
     }
 
     private func isWidgetWindow(_ window: AXUIElement) -> Bool {
@@ -292,23 +306,38 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
             return
         }
 
-        if cachedInitialPosition == nil {
-            cacheInitialNotificationData(windowSize: windowSize, notifSize: notifSize, position: position)
-        } else if position != cachedInitialPosition {
-            setPosition(window, x: cachedInitialPosition!.x, y: cachedInitialPosition!.y)
+        // Determine which screen this notification belongs to
+        guard let screen = NotificationGeometry.screen(containing: position) else {
+            debugLog("Could not determine screen for position \(position)")
+            return
         }
 
-        let newPosition: (x: CGFloat, y: CGFloat) = calculateNewPosition(
-            windowSize: cachedInitialWindowSize!,
-            notifSize: cachedInitialNotifSize!,
-            position: cachedInitialPosition!,
-            padding: cachedInitialPadding!
+        let cache = cacheInitialNotificationData(
+            screen: screen,
+            windowSize: windowSize,
+            notifSize: notifSize,
+            position: position
         )
 
-        setPosition(window, x: newPosition.x, y: newPosition.y)
+        if position != cache.initialPosition {
+            setPosition(window, x: cache.initialPosition.x, y: cache.initialPosition.y)
+        }
+
+        let newPos = NotificationGeometry.newPosition(
+            for: currentPosition,
+            windowSize: cache.initialWindowSize,
+            notifSize: cache.initialNotifSize,
+            origin: cache.initialPosition,
+            padding: cache.initialPadding,
+            screenFrame: screen.frame,
+            visibleFrame: screen.visibleFrame,
+            paddingAboveDock: paddingAboveDock
+        )
+
+        setPosition(window, x: newPos.x, y: newPos.y)
 
         pollingEndTime = Date().addingTimeInterval(6.5)
-        debugLog("Moved notification to \(currentPosition.displayName) at (\(newPosition.x), \(newPosition.y))")
+        debugLog("Moved notification to \(currentPosition.displayName) at (\(newPos.x), \(newPos.y)) on display \(screen.displayID)")
     }
 
     private func moveAllNotifications() {
@@ -530,40 +559,6 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return position
     }
 
-    private func calculateNewPosition(
-        windowSize: CGSize,
-        notifSize: CGSize,
-        position: CGPoint,
-        padding: CGFloat
-    ) -> (x: CGFloat, y: CGFloat) {
-        debugLog("Calculating new position with windowSize: \(windowSize), notifSize: \(notifSize), position: \(position), padding: \(padding)")
-        let newX: CGFloat
-        let newY: CGFloat
-
-        switch currentPosition {
-        case .topLeft, .middleLeft, .bottomLeft:
-            newX = padding - position.x
-        case .topMiddle, .bottomMiddle, .deadCenter:
-            newX = (windowSize.width - notifSize.width) / 2 - position.x
-        case .topRight, .middleRight, .bottomRight:
-            newX = 0
-        }
-
-        switch currentPosition {
-        case .topLeft, .topMiddle, .topRight:
-            newY = 0
-        case .middleLeft, .middleRight, .deadCenter:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = (windowSize.height - notifSize.height) / 2 - dockSize
-        case .bottomLeft, .bottomMiddle, .bottomRight:
-            let dockSize: CGFloat = NSScreen.main!.frame.height - NSScreen.main!.visibleFrame.height
-            newY = windowSize.height - notifSize.height - dockSize - paddingAboveDock
-        }
-
-        debugLog("Calculated new position - x: \(newX), y: \(newY)")
-        return (newX, newY)
-    }
-
     private func getWindowTitle(_ element: AXUIElement) -> String? {
         var titleRef: AnyObject?
         guard AXUIElementCopyAttributeValue(element, kAXTitleAttribute as CFString, &titleRef) == .success else {
@@ -622,7 +617,12 @@ private func observerCallback(observer _: AXObserver, element: AXUIElement, noti
     }
 }
 
-let app: NSApplication = .shared
-let delegate: NotificationMover = .init()
-app.delegate = delegate
-app.run()
+@main
+enum PingPlaceApp {
+    static func main() {
+        let app: NSApplication = .shared
+        let delegate: NotificationMover = .init()
+        app.delegate = delegate
+        app.run()
+    }
+}
