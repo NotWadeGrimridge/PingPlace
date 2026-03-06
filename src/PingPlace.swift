@@ -27,6 +27,11 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var lastKnownWindowCount: Int = 0
     private var pollingEndTime: Date?
 
+    // macOS 26.3+: tracks whether we've shifted an AXSystemDialog window for banner repositioning
+    private var bannerIsActive: Bool = false
+    private var lastBannerX: CGFloat = 0
+    private var bannerStableCount: Int = 0
+
     private var currentPosition: NotificationPosition = {
         guard let rawValue: String = UserDefaults.standard.string(forKey: "notificationPosition"),
               let position = NotificationPosition(rawValue: rawValue)
@@ -226,6 +231,9 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         debugLog("Position changed: \(oldPosition.displayName) → \(position.displayName)")
+        // Reset banner tracking so polling re-applies with new position
+        bannerIsActive = false
+        bannerStableCount = 0
         moveAllNotifications()
     }
 
@@ -267,77 +275,123 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return false
     }
 
+    private let bannerSubroles: [String] = [
+        "AXNotificationCenterBanner",
+        "AXNotificationCenterAlert",
+        "AXNotificationCenterNotification",
+        "AXNotificationCenterBannerWindow",
+    ]
+
+    private func getSubrole(of element: AXUIElement) -> String? {
+        var ref: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &ref) == .success else { return nil }
+        return ref as? String
+    }
+
+    /// Move a notification banner. On macOS < 26.3, `window` is a per-notification window.
+    /// On macOS 26.3+, `window` is the full-screen AXSystemDialog containing the banner.
     func moveNotification(_ window: AXUIElement) {
         guard currentPosition != .topRight else { return }
 
-        if isWidgetWindow(window) {
+        let isSystemDialog = getSubrole(of: window) == "AXSystemDialog"
+
+        // Only run widget check for pre-26.3 per-notification windows.
+        // AXSystemDialog is a full-screen container that may include widget elements
+        // alongside notification banners — checking it would false-positive.
+        if !isSystemDialog, isWidgetWindow(window) {
             debugLog("Skipping move - widget window detected")
             return
         }
 
-        let targetSubroles: [String] = [
-            "AXNotificationCenterBanner",
-            "AXNotificationCenterAlert",
-            "AXNotificationCenterNotification",
-            "AXNotificationCenterBannerWindow",
-        ]
         guard let windowSize: CGSize = getSize(of: window) else {
             debugLog("Failed to get window size")
             return
         }
 
-        // Try finding banner container by subrole (works on older macOS)
-        // Fall back to using the window itself (macOS 26.3+ uses AXSystemDialog)
+        // Find the banner element inside the window
         let notifSize: CGSize
-        let position: CGPoint
+        let bannerPos: CGPoint
 
-        if let found = findElementWithSubrole(root: window, targetSubroles: targetSubroles),
+        if let found = findElementWithSubrole(root: window, targetSubroles: bannerSubroles),
            let size = getSize(of: found),
            let pos = getPosition(of: found) {
             notifSize = size
-            position = pos
-        } else if let size = getSize(of: window),
-                  let pos = getPosition(of: window) {
-            debugLog("Using window directly for positioning (macOS 26.3+ fallback)")
+            bannerPos = pos
+        } else if !isSystemDialog, let size = getSize(of: window), let pos = getPosition(of: window) {
+            // Pre-26.3 fallback: use the window itself
             notifSize = size
-            position = pos
+            bannerPos = pos
         } else {
-            debugLog("Failed to get notification dimensions or find banner container")
+            debugLog("No banner found in window")
             return
         }
 
-        // Determine which screen this notification belongs to
-        guard let screen = NotificationGeometry.screen(containing: position) else {
-            debugLog("Could not determine screen for position \(position)")
+        // For AXSystemDialog, the banner's absolute position may be shifted off-screen
+        // if the window was previously moved. Use the banner's natural position (relative
+        // to window origin) for screen detection.
+        let screenLookupPos: CGPoint
+        if isSystemDialog, let windowPos = getPosition(of: window) {
+            let naturalX = bannerPos.x - windowPos.x
+            let naturalY = bannerPos.y - windowPos.y
+            screenLookupPos = CGPoint(x: naturalX, y: naturalY)
+        } else {
+            screenLookupPos = bannerPos
+        }
+
+        guard let screen = NotificationGeometry.screen(containing: screenLookupPos) else {
+            debugLog("Could not determine screen for position \(screenLookupPos)")
             return
         }
 
-        let cache = cacheInitialNotificationData(
-            screen: screen,
-            windowSize: windowSize,
-            notifSize: notifSize,
-            position: position
-        )
+        if isSystemDialog {
+            // macOS 26.3+: the banner lives inside a full-screen AXSystemDialog.
+            // We shift the entire window so the banner lands at the desired screen position.
+            let windowPos = getPosition(of: window) ?? CGPoint.zero
 
-        if position != cache.initialPosition {
-            setPosition(window, x: cache.initialPosition.x, y: cache.initialPosition.y)
+            let newPos = NotificationGeometry.systemDialogPosition(
+                for: currentPosition,
+                bannerPos: bannerPos,
+                windowPos: windowPos,
+                notifSize: notifSize,
+                screenFrame: screen.frame,
+                visibleFrame: screen.visibleFrame,
+                paddingAboveDock: paddingAboveDock
+            )
+
+            if abs(newPos.x - windowPos.x) > 1 || abs(newPos.y - windowPos.y) > 1 {
+                setPosition(window, x: newPos.x, y: newPos.y)
+                bannerIsActive = true
+                debugLog("Set AXSystemDialog to (\(newPos.x), \(newPos.y)) for \(currentPosition.displayName)")
+            }
+        } else {
+            // Pre-26.3: each notification is its own window — use original positioning logic
+            let cache = cacheInitialNotificationData(
+                screen: screen,
+                windowSize: windowSize,
+                notifSize: notifSize,
+                position: bannerPos
+            )
+
+            if bannerPos != cache.initialPosition {
+                setPosition(window, x: cache.initialPosition.x, y: cache.initialPosition.y)
+            }
+
+            let newPos = NotificationGeometry.newPosition(
+                for: currentPosition,
+                windowSize: cache.initialWindowSize,
+                notifSize: cache.initialNotifSize,
+                origin: cache.initialPosition,
+                padding: cache.initialPadding,
+                screenFrame: screen.frame,
+                visibleFrame: screen.visibleFrame,
+                paddingAboveDock: paddingAboveDock
+            )
+
+            setPosition(window, x: newPos.x, y: newPos.y)
+            debugLog("Moved notification window to \(currentPosition.displayName) at (\(newPos.x), \(newPos.y))")
         }
-
-        let newPos = NotificationGeometry.newPosition(
-            for: currentPosition,
-            windowSize: cache.initialWindowSize,
-            notifSize: cache.initialNotifSize,
-            origin: cache.initialPosition,
-            padding: cache.initialPadding,
-            screenFrame: screen.frame,
-            visibleFrame: screen.visibleFrame,
-            paddingAboveDock: paddingAboveDock
-        )
-
-        setPosition(window, x: newPos.x, y: newPos.y)
 
         pollingEndTime = Date().addingTimeInterval(6.5)
-        debugLog("Moved notification to \(currentPosition.displayName) at (\(newPos.x), \(newPos.y)) on display \(screen.displayID)")
     }
 
     private func moveAllNotifications() {
@@ -358,6 +412,8 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
 
         for window in windows {
+            // Skip AXSystemDialog — handled by pollForNewWindows with stabilization
+            if getSubrole(of: window) == "AXSystemDialog" { continue }
             moveNotification(window)
         }
     }
@@ -486,14 +542,62 @@ class NotificationMover: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func pollForNewWindows() {
-        let currentCount = getNotificationWindowCount()
+        guard let pid: pid_t = NSWorkspace.shared.runningApplications.first(where: {
+            $0.bundleIdentifier == notificationCenterBundleID
+        })?.processIdentifier else { return }
 
-        if currentCount > lastKnownWindowCount {
-            debugLog("Polling detected new window(s): \(lastKnownWindowCount) -> \(currentCount)")
+        let app: AXUIElement = AXUIElementCreateApplication(pid)
+        var windowsRef: AnyObject?
+        guard AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+              let windows = windowsRef as? [AXUIElement] else { return }
+
+        // Detect new windows (pre-26.3 path — exclude AXSystemDialog, handled below)
+        let nonDialogCount = windows.filter { getSubrole(of: $0) != "AXSystemDialog" }.count
+        if nonDialogCount > lastKnownWindowCount {
+            debugLog("Polling detected new window(s): \(lastKnownWindowCount) -> \(nonDialogCount)")
             moveAllNotifications()
         }
+        lastKnownWindowCount = nonDialogCount
 
-        lastKnownWindowCount = currentCount
+        // macOS 26.3+: detect banners inside AXSystemDialog windows
+        var foundBanner = false
+        for window in windows {
+            if getSubrole(of: window) == "AXSystemDialog" {
+                if let banner = findElementWithSubrole(root: window, targetSubroles: bannerSubroles),
+                   let pos = getPosition(of: banner) {
+                    foundBanner = true
+                    if !bannerIsActive {
+                        // Wait for the slide-in animation to finish before moving.
+                        // The banner position stabilizes ~300ms after appearing.
+                        if abs(pos.x - lastBannerX) < 2 {
+                            bannerStableCount += 1
+                        } else {
+                            bannerStableCount = 0
+                            lastBannerX = pos.x
+                        }
+                        // Stable for 3 consecutive polls (300ms at 100ms interval)
+                        if bannerStableCount >= 3 {
+                            debugLog("Banner stabilized at x=\(pos.x) — moving")
+                            moveNotification(window)
+                            bannerStableCount = 0
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reset AXSystemDialog position when banner dismisses
+        if !foundBanner && bannerIsActive {
+            debugLog("Banner dismissed — resetting AXSystemDialog position")
+            for window in windows {
+                if getSubrole(of: window) == "AXSystemDialog" {
+                    setPosition(window, x: 0, y: 0)
+                }
+            }
+            bannerIsActive = false
+            bannerStableCount = 0
+            lastBannerX = 0
+        }
     }
 
     private func getWindowIdentifier(_ element: AXUIElement) -> String? {
@@ -613,6 +717,14 @@ private func observerCallback(observer _: AXObserver, element: AXUIElement, noti
 
     let notificationString: String = notification as String
     if notificationString == kAXWindowCreatedNotification as String {
+        // On macOS 26.3+, notifications live inside AXSystemDialog. The banner
+        // slides in over ~300ms, so immediate moves get overridden by the animation.
+        // Let pollForNewWindows handle AXSystemDialog with stabilization.
+        var subroleRef: AnyObject?
+        if AXUIElementCopyAttributeValue(element, kAXSubroleAttribute as CFString, &subroleRef) == .success,
+           let subrole = subroleRef as? String, subrole == "AXSystemDialog" {
+            return
+        }
         mover.moveNotification(element)
     }
 }
